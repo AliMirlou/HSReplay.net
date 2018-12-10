@@ -29,7 +29,7 @@ The full backend stack is written in Python 3.
 * Interactive UI: [React](https://reactjs.org/)
 * Styling: [Sass](https://sass-lang.com/)
 * Type checking: [Typescript](https://www.typescriptlang.org/)
-* Compatability: [Babel](https://babeljs.io/)
+* Compatibility: [Babel](https://babeljs.io/)
 * Bundling: [Webpack](https://webpack.js.org/)
 
 
