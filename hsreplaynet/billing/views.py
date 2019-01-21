@@ -114,10 +114,30 @@ class SubscribeMixin:
 		if not user.is_authenticated:
 			return False
 
+		# refresh all pending and active BillingAgreements
+		for agreement in BillingAgreement.objects.filter(
+			user=user, state__in=["Pending", "Active"]
+		):
+			BillingAgreement.find_and_sync(agreement.id)
+
 		if user.is_premium:
 			return False
 
-		if BillingAgreement.objects.filter(user=user, state="Pending").count() > 0:
+		# reject if there's any remaining pending or active BillingAgreements
+		stale_agreements = BillingAgreement.objects.filter(
+			user=user, state__in=["Pending", "Active"]
+		)
+		if stale_agreements.count() > 0:
+			for agreement in stale_agreements:
+				# Log an error
+				influx_metric(
+					"hsreplaynet_paypal_stale_agreement",
+					{
+						"count": "1",
+						"id": agreement.id
+					},
+					state=agreement.state
+				)
 			return False
 
 		return True
@@ -561,7 +581,7 @@ class BasePaypalView(View):
 		return redirect(self.fail_url)
 
 
-class PaypalSuccessView(BasePaypalView, SubscribeMixin):
+class PaypalSuccessView(LoginRequiredMixin, SubscribeMixin, BasePaypalView):
 	success_url = reverse_lazy("premium")
 
 	def get_success_url(self):
@@ -575,9 +595,6 @@ class PaypalSuccessView(BasePaypalView, SubscribeMixin):
 
 		self.request = request
 
-		if not self.can_subscribe():
-			return self.fail(_("You already have an active or a pending subscription."))
-
 		token = request.GET.get("token", "")
 		if not token:
 			return self.fail(_("Unable to complete subscription."))
@@ -589,6 +606,9 @@ class PaypalSuccessView(BasePaypalView, SubscribeMixin):
 
 		if prepared_agreement.user != self.request.user:
 			return self.fail(_("You are not logged in as the correct user."))
+
+		if not self.can_subscribe():
+			return self.fail(_("You already have an active or a pending subscription."))
 
 		billing_agreement = prepared_agreement.execute()
 
@@ -603,6 +623,11 @@ class PaypalSuccessView(BasePaypalView, SubscribeMixin):
 			},
 			state=billing_agreement.state
 		)
+
+		# In some cases, PayPal instantly sets the state to cancelled. Possibly the initial
+		# payment failed. Let's inform the user that something went wrong.
+		if billing_agreement.state in ("Canceled", "Cancelled"):
+			return self.fail(_("Subscription was cancelled by PayPal."))
 
 		# Null out the premium checkout timestamp so that we don't remind the user to
 		# complete the checkout process.

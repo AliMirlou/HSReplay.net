@@ -4,6 +4,7 @@ import json
 import os
 import string
 import time
+from typing import Set
 
 from django.conf import settings
 from django.contrib.postgres.fields import ArrayField, JSONField
@@ -222,6 +223,49 @@ class Deck(models.Model):
 		mana_sorted = sorted(alpha_sorted, key=lambda c: c.cost)
 		return mana_sorted.__iter__()
 
+	def __len__(self):
+		size = self.size
+		if self.size is None:
+			size = sum(i.count for i in self.includes.all())
+		return size
+
+	def __contains__(self, item):
+		if isinstance(item, Card):
+			item = item.card_id
+		if isinstance(item, int):
+			return self.includes.filter(card__dbf_id=item).exists()
+		if isinstance(item, str):
+			return self.includes.filter(card__card_id=item).exists()
+		return NotImplemented
+
+	def issubset(self, deck: "Deck") -> bool:
+		"""Test whether every card in self is in deck."""
+		if isinstance(deck, self.__class__):
+			sub = self.card_dbf_id_list()
+			super = deck.card_dbf_id_list()
+			for dbf_id in sub:
+				try:
+					super.remove(dbf_id)
+				except ValueError:
+					return False
+			return True
+
+		raise NotImplementedError
+
+	def issuperset(self, deck: "Deck") -> bool:
+		"""Test whether every card in deck is in self."""
+		if isinstance(deck, self.__class__):
+			sub = deck.card_dbf_id_list()
+			super = self.card_dbf_id_list()
+			for dbf_id in sub:
+				try:
+					super.remove(dbf_id)
+				except ValueError:
+					return False
+			return True
+
+		raise NotImplementedError
+
 	@cached_property
 	def hero(self):
 		deck_class = self.deck_class
@@ -295,10 +339,13 @@ class Deck(models.Model):
 
 	@property
 	def is_full_deck(self):
-		size = self.size
-		if self.size is None:
-			size = sum(i.count for i in self.includes.all())
-		return size == 30
+		return len(self) == 30
+
+	@property
+	def guessed_archetype(self):
+		if self.guessed_full_deck:
+			return self.guessed_full_deck.archetype
+		return self.archetype
 
 	def get_absolute_url(self):
 		if not self.is_full_deck:
@@ -344,7 +391,9 @@ class Deck(models.Model):
 	def card_dbf_id_list(self):
 		result = []
 
-		includes = self.includes.values_list("card__dbf_id", "count")
+		includes = self.includes \
+			.values_list("card__dbf_id", "count") \
+			.order_by("card__cost", "card__name")
 		for id, count in includes:
 			for i in range(count):
 				result.append(id)
@@ -358,7 +407,9 @@ class Deck(models.Model):
 	def card_id_list(self):
 		result = []
 
-		includes = self.includes.values_list("card__card_id", "count")
+		includes = self.includes \
+			.values_list("card__card_id", "count") \
+			.order_by("card__cost", "card__name")
 		for id, count in includes:
 			for i in range(count):
 				result.append(id)
@@ -366,7 +417,11 @@ class Deck(models.Model):
 		return result
 
 	def predicted_card_id_list(self):
-		if self.guessed_full_deck and self.digest != self.guessed_full_deck.digest:
+		if (
+			self.guessed_full_deck and
+			self.digest != self.guessed_full_deck.digest and
+			self.issubset(self.guessed_full_deck)
+		):
 			return self.guessed_full_deck.card_id_list()
 
 	def as_dbf_json(self, serialized=True):
@@ -978,6 +1033,13 @@ class ClusterManager(models.Manager):
 
 			return result
 
+	def get_required_cards_for_player_class(self, game_format, player_class) -> Set[int]:
+		weights = self.get_signature_weights(game_format, player_class)
+		required_cards = set()
+		for cluster in weights.values():
+			required_cards.update(cluster["required_cards"])
+		return required_cards
+
 	def get_live_cluster_for_archetype(self, game_format, archetype):
 		return ClusterSnapshot.objects.filter(
 			class_cluster__player_class=archetype.player_class,
@@ -1160,7 +1222,7 @@ class ClusterSetSnapshot(models.Model, ClusterSet):
 			for cluster in class_cluster.clusters:
 				cluster.save()
 
-	def update_archetype_signatures(self, force=False):
+	def update_archetype_signatures(self, force=False, overwrite_archetypes=False):
 		if force or all(c.neural_network_ready() for c in self.class_clusters):
 			with transaction.atomic():
 				ClusterSetSnapshot.objects.filter(
@@ -1169,10 +1231,23 @@ class ClusterSetSnapshot(models.Model, ClusterSet):
 				self.live_in_production = True
 				self.promoted_on = now()
 				self.save()
-				self.synchronize_deck_archetype_assignments()
+				self.synchronize_required_cards()
+				if overwrite_archetypes:
+					self.synchronize_deck_archetype_assignments()
 		else:
 			msg = "Cannot promote to live=True because the neural network is not ready"
 			raise RuntimeError(msg)
+
+	def synchronize_required_cards(self):
+		for class_cluster in self.class_clusters:
+			for cluster in class_cluster.clusters:
+				if cluster.external_id and cluster.external_id != -1:
+					archetype = Archetype.objects.get(pk=cluster.external_id)
+					# Overwrite the archetype's existing required cards with the cluster's
+					# required card set.
+					archetype.required_cards.clear()
+					for dbf_id in cluster.required_cards:
+						archetype.required_cards.add(Card.objects.get(dbf_id=dbf_id))
 
 	def synchronize_deck_archetype_assignments(self):
 		for_update = collections.defaultdict(list)
@@ -1183,15 +1258,6 @@ class ClusterSetSnapshot(models.Model, ClusterSet):
 					for data_point in cluster.data_points:
 						digest = Deck.objects.get_digest_from_shortid(data_point["shortid"])
 						for_update[cluster.external_id].append(digest)
-
-					# Overwrite the archetype's existing required cards with the cluster's
-					# required card set.
-
-					archetype = Archetype.objects.get(pk=cluster.external_id)
-					archetype.required_cards.clear()
-
-					for dbf_id in cluster.required_cards:
-						archetype.required_cards.add(Card.objects.get(dbf_id=dbf_id))
 
 		for external_id, digests in for_update.items():
 			deck_ids = Deck.objects.filter(digest__in=digests).values_list("id", flat=True)

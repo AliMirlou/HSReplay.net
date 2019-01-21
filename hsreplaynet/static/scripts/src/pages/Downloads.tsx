@@ -154,7 +154,7 @@ class Downloads extends React.Component<Props, State> {
 								image={image("downloads/played.png")}
 								subtitle={t("Opponent Card Tracking")}
 								text={t(
-									"Track what cards your opponent has revealed to far.",
+									"Track what cards your opponent has revealed so far.",
 								)}
 							/>
 						</div>
@@ -201,7 +201,7 @@ class Downloads extends React.Component<Props, State> {
 						<div className="clearfix" />
 					</section>
 					<section id="companion">
-						<h1>Companion app</h1>
+						<h1>{t("Companion app")}</h1>
 						<div className="col-lg-4 col-sm-12">
 							<PremiumFeaturePanel
 								title={null}
